@@ -373,24 +373,48 @@ fn update_docblock(
         // etc.) we fall back to the legacy block layout in the
         // docblock.
         if let Some(item_decl_code) = find_item_decl_code(docblock_elem) {
+            // Build the spec block as a flat sequence inside the
+            // item-decl <pre>:
+            //   <newline before div>
+            //   <div class="verus-spec">
+            //     [keyword]
+            //     "\n    " <inlined clause spans> for each clause
+            //     "\n" [next keyword]
+            //     ...
+            //     <inlined body spans>   (body has no keyword and no
+            //                             leading newline — the body's
+            //                             content already starts at the
+            //                             column it should render at,
+            //                             i.e. "{" flush-left)
+            //   </div>
+            //
+            // The literal `\n` we add *before* the div places the div
+            // on its own line inside the surrounding <pre>; the CSS
+            // keeps `.verus-spec` itself flowing inline so we don't
+            // pick up an extra blank line on top of it.
             let spec_node = mk_spec_node();
-            let mut first_keyword = true;
+            let mut first_chunk = true;
             for (spec_name, code_blocks) in grouped.iter() {
                 let is_body = *spec_name == "body";
                 if !is_body {
-                    if !first_keyword {
+                    if !first_chunk {
                         spec_node.append(NodeRef::new_text("\n"));
                     }
                     spec_node.append(mk_spec_keyword_node(spec_name));
-                    first_keyword = false;
+                    first_chunk = false;
                 }
                 for code_block in code_blocks.iter() {
-                    spec_node.append(NodeRef::new_text(if is_body { "\n" } else { "\n    " }));
+                    if is_body {
+                        if !first_chunk {
+                            spec_node.append(NodeRef::new_text("\n"));
+                        }
+                    } else {
+                        spec_node.append(NodeRef::new_text("\n    "));
+                    }
                     inline_pre_contents_into(&spec_node, code_block);
+                    first_chunk = false;
                 }
             }
-            // A bare newline before the div makes the block render on
-            // its own line inside the surrounding `<pre>`.
             item_decl_code.append(NodeRef::new_text("\n"));
             item_decl_code.append(spec_node);
         } else {
@@ -862,14 +886,19 @@ fn write_css(dir_path: &Path) {
     rustdoc_css
         .write_all(
             r#"
-/* The spec block is injected into the item-decl `<pre>` as plain
- * inline content with literal whitespace (newlines + 4-space indent
- * for clauses), matching rustdoc's `<div class="where">` shape. No
- * extra display/padding rules are needed — the surrounding `<pre>`
- * preserves the whitespace and inherits the right typography.
+/* The spec block matches rustdoc's `<div class="where">` shape:
+ * inside an item-decl `<pre>` it flows inline so that the literal
+ * `\n` we emit before/inside it controls the layout (no extra blank
+ * line from a block-level box), and on the fallback path (no
+ * stand-alone item-decl pre — trait-method pages, etc.) it falls
+ * back to a block-level display so it's still visually separated
+ * from the surrounding doc text.
  */
 .verus-spec {
   display: block;
+}
+pre .verus-spec {
+  display: inline;
 }
 
 /* Use the theme's main text color for verus-only keywords so they
