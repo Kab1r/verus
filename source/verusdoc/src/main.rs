@@ -175,6 +175,49 @@ fn get_single_child(node: &NodeRef) -> Option<NodeRef> {
     Some(child)
 }
 
+/// Walk up from `node` looking for a preceding-sibling
+/// `<pre class="rust item-decl">` at any ancestor level. Returns the
+/// `<code>` child of that `<pre>` so callers can append directly to
+/// the signature contents.
+///
+/// Used so the verus spec block can render *inside* the same item-decl
+/// `<pre>` as the function signature (mirroring how rustdoc places
+/// `<div class="where">` for ordinary `where` clauses), instead of as
+/// a sibling block above the docblock.
+fn find_item_decl_code(node: &NodeRef) -> Option<NodeRef> {
+    let mut current = node.clone();
+    loop {
+        let mut sibling = current.previous_sibling();
+        while let Some(sib) = sibling {
+            if let Some(elem) = sib.as_element() {
+                if &*elem.name.local == "pre" {
+                    let attrs = elem.attributes.borrow();
+                    if let Some(class) = attrs.get(local_name!("class")) {
+                        if class.split_whitespace().any(|c| c == "item-decl") {
+                            // Found the item-decl <pre>; descend to its
+                            // <code> child (rustdoc always wraps the
+                            // signature in <code> inside <pre>).
+                            drop(attrs);
+                            let mut child = sib.first_child();
+                            while let Some(c) = child {
+                                if let Some(e) = c.as_element() {
+                                    if &*e.name.local == "code" {
+                                        return Some(c);
+                                    }
+                                }
+                                child = c.next_sibling();
+                            }
+                            return None;
+                        }
+                    }
+                }
+            }
+            sibling = sib.previous_sibling();
+        }
+        current = current.parent()?;
+    }
+}
+
 /// Check if the node is an element with the given tag name
 fn is_element(node: &NodeRef, name: &str) -> bool {
     match node.as_element() {
@@ -297,7 +340,23 @@ fn update_docblock(
         for elem in elems.into_iter() {
             spec_node.append(elem);
         }
-        docblock_elem.prepend(spec_node);
+
+        // Prefer to render the spec block *inside* the function's
+        // item-decl `<pre>`, so requires/ensures appear as a
+        // continuation of the signature (the same shape rustdoc
+        // uses for ordinary `where` clauses). Fall back to the
+        // legacy docblock placement if the surrounding HTML doesn't
+        // expose an item-decl pre — that path covers things like
+        // trait-method pages where the spec is rendered next to a
+        // method header rather than a stand-alone signature.
+        if let Some(item_decl_code) = find_item_decl_code(docblock_elem) {
+            // A bare newline before the div makes the block render on
+            // its own line inside the surrounding <pre>.
+            item_decl_code.append(NodeRef::new_text("\n"));
+            item_decl_code.append(spec_node);
+        } else {
+            docblock_elem.prepend(spec_node);
+        }
     }
 
     // Add mode info to the signature
@@ -737,57 +796,53 @@ fn write_css(dir_path: &Path) {
     rustdoc_css
         .write_all(
             r#"
-.verus-spec-code {
-  padding: 0px !important;
-  margin: 0px;
-  font-size: 14px;
-}
-
-pre.verus-spec-code {
-  margin-left: 40px !important;
-}
-
+/* Spec/body blocks live inside the item-decl <pre> when one is
+ * present (find_item_decl_code in main.rs), so their typography
+ * inherits from the surrounding <pre>. The block resets are kept so
+ * the legacy "spec rendered in docblock" fallback path stays
+ * readable on trait-method pages.
+ */
+.verus-spec-code,
 .verus-body-code {
-  padding: 0px !important;
-  margin: 0px;
-  font-size: 14px;
+  padding: 0 !important;
+  margin: 0;
+  background: transparent !important;
+  border: 0 !important;
+}
+.verus-spec-code code,
+.verus-body-code code {
+  background: transparent !important;
 }
 
-pre.verus-body-code {
-  margin-left: 8px !important;
+/* Mirror rustdoc's `where`-clause indentation (~ 4 spaces) so the
+ * `requires` / `ensures` headers line up under the closing paren of
+ * the signature.
+ */
+.verus-spec {
+  display: block;
+}
+.verus-spec .verus-spec-keyword {
+  display: block;
+  padding-left: 4ch;
+}
+.verus-spec .verus-spec-code,
+.verus-spec .verus-body-code {
+  display: block;
+  padding-left: 8ch;
 }
 
+/* Use the theme's main text color for verus-only keywords so they
+ * read the same as `pub`/`fn` in any theme (light/dark/ayu) instead
+ * of the previous hardcoded dark-green that disappeared on dark
+ * backgrounds. The font-style flag keeps them visually distinct
+ * without relying on color alone.
+ */
+.verus-sig-keyword,
 .verus-spec-keyword {
   font-family: "Source Code Pro", monospace;
-  color: #006400;
-  font-size: 14px;
+  color: var(--main-color, currentColor);
+  font-style: italic;
 }
-
-.verus-sig-keyword {
-  font-family: "Source Code Pro", monospace;
-  color: #006400;
-}
-
-.verus-spec {
-    margin-top: -8px;
-    padding-bottom: 18px;
-    margin-left: 16px;
-}
-
-:root[data-theme="dark"] .verus-body-code { background-color: #353535 !important; }
-:root[data-theme="dark"] .verus-spec-code { background-color: #353535 !important; }
-:root[data-theme="dark"] .verus-body-code code { background-color: #353535 !important; }
-:root[data-theme="dark"] .verus-spec-code code { background-color: #353535 !important; }
-
-:root[data-theme="ayu"] .verus-body-code { background-color: #0f1419 !important; }
-:root[data-theme="ayu"] .verus-spec-code { background-color: #0f1419 !important; }
-:root[data-theme="ayu"] .verus-body-code code { background-color: #0f1419 !important; }
-:root[data-theme="ayu"] .verus-spec-code code { background-color: #0f1419 !important; }
-
-:root[data-theme="light"] .verus-body-code { background-color: #ffffff !important; }
-:root[data-theme="light"] .verus-spec-code { background-color: #ffffff !important; }
-:root[data-theme="light"] .verus-body-code code { background-color: #ffffff !important; }
-:root[data-theme="light"] .verus-spec-code code { background-color: #ffffff !important; }
 "#
             .as_bytes(),
         )
