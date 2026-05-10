@@ -46,52 +46,25 @@ use verus_syn::{
 /// Activation is *intentionally per-rustdoc-invocation*: the same
 /// crate's rustc compile (e.g. vstd's rmeta build under
 /// `cargo verus doc`) must NOT see the markers, because the
-/// assume_specification shape they're paired with isn't valid input
-/// to the VIR translation that runs during the rustc compile.
+/// `assume_specification` shape they're paired with isn't valid
+/// input to the VIR translation that runs during the rustc compile.
 ///
-/// Two activation paths, in priority order:
+/// `cargo verus doc` arranges for `VERUSDOC=1` to be set only in the
+/// rustdoc subprocess by routing rustdoc through the
+/// `verus-rustdoc-shim` binary (cargo's `RUSTDOC` env var points at
+/// the shim; the shim sets `VERUSDOC=1` and execs the real rustdoc).
+/// The wrapped rustc invocations that cargo also runs to build dep
+/// rmetas inherit the parent cargo process's env, which does NOT have
+/// `VERUSDOC` set, so `env_rustdoc()` returns false there.
 ///
-/// 1. The host process is `rustdoc` rather than `rustc`. The
-///    proc-macro runs in-process with its host, so `std::env::args()`
-///    sees the host binary path; we treat anything matching
-///    `rustdoc` (or `rustdoc.exe`) as rustdoc mode. This is the
-///    `cargo verus doc` activation: cargo invokes rustc to build dep
-///    rmetas (rustc → false here, no markers leak) and rustdoc to
-///    document workspace crates (rustdoc → true here, markers fire).
-///    It also covers the upstream `tools/docs.sh` direct-rustdoc
-///    invocation without needing the env var below.
-/// 2. Legacy: `VERUSDOC=1` in the process environment. Kept for
-///    compatibility with paths that explicitly opt in via env var
-///    (e.g. wrapping rustdoc through a custom shim) even when the
-///    host binary's name doesn't match. This setting leaks into
-///    rustc-driven builds, so callers that mix rustc + rustdoc
-///    should prefer relying on path (1).
+/// The upstream `tools/docs.sh` standalone-rustdoc path also exports
+/// `VERUSDOC=1` directly and continues to work.
 #[cfg(verus_keep_ghost)]
 pub fn env_rustdoc() -> bool {
-    if host_binary_is_rustdoc() {
-        return true;
-    }
     match proc_macro::tracked::env_var("VERUSDOC") {
         Err(_) => false, // VERUSDOC key not present in environment
         Ok(s) => s == "1",
     }
-}
-
-#[cfg(verus_keep_ghost)]
-fn host_binary_is_rustdoc() -> bool {
-    let Some(bin) = std::env::args_os().next() else {
-        return false;
-    };
-    let bin_str = bin.to_string_lossy().to_lowercase();
-    // Match `…/rustdoc`, `rustdoc`, `rustdoc.exe`, but not the rustc
-    // binary even when invoked with a path containing the word
-    // (`/path/to/some-rustdoc-tool/rustc` should be rustc, not
-    // rustdoc). Use the file-name component for the check.
-    let file_name = std::path::Path::new(&*bin_str)
-        .file_name()
-        .map(|f| f.to_string_lossy().into_owned())
-        .unwrap_or(bin_str);
-    file_name == "rustdoc" || file_name == "rustdoc.exe"
 }
 
 /// Check if VERUSDOC=1.
