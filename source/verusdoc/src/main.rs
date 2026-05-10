@@ -113,6 +113,13 @@ fn process_file(path: &Path) {
     for docblock_elem in document.select(".docblock").expect("code selector") {
         let docblock_elem: &NodeRef = docblock_elem.as_node();
 
+        // Pull the rendered intra-doc link map out of the docblock
+        // before processing clauses so we can apply name → href
+        // rewrites to the spliced verus-spec content below. Extracting
+        // it first also detaches the marker comments and the resolved
+        // `<ul>` so they don't render in the visible docs.
+        let link_map = extract_and_detach_link_map(docblock_elem);
+
         // Iterate over elements. For each one, check if it is a
         // verusdoc_special_attr block. If so, remove it.
 
@@ -135,7 +142,7 @@ fn process_file(path: &Path) {
 
         // Now add content based on the data we just collected.
 
-        update_docblock(&docblock_elem, &attrs, &opt_trait_info);
+        update_docblock(&docblock_elem, &attrs, &opt_trait_info, &link_map);
     }
 
     document.serialize_to_file(path).expect("serialize_to_file");
@@ -329,6 +336,7 @@ fn update_docblock(
     docblock_elem: &NodeRef,
     attrs: &Vec<VerusDocAttr>,
     opt_trait_info: &Option<TraitInfo>,
+    link_map: &HashMap<String, String>,
 ) {
     // The output mirrors the rustdoc `where`-clause shape:
     //
@@ -389,6 +397,7 @@ fn update_docblock(
         // If no item-decl pre is available (trait-method pages,
         // etc.) we fall back to the legacy block layout in the
         // docblock.
+        let final_spec_node: NodeRef;
         if let Some(item_decl_code) = find_item_decl_code(docblock_elem) {
             // Build the spec block as a flat sequence inside the
             // item-decl <pre>:
@@ -433,7 +442,8 @@ fn update_docblock(
                 }
             }
             item_decl_code.append(NodeRef::new_text("\n"));
-            item_decl_code.append(spec_node);
+            item_decl_code.append(spec_node.clone());
+            final_spec_node = spec_node;
         } else {
             // Fallback: keep the legacy block layout — keyword span
             // followed by `<pre class="verus-spec-code">` blocks.
@@ -462,7 +472,15 @@ fn update_docblock(
             for elem in elems.into_iter() {
                 spec_node.append(elem);
             }
-            docblock_elem.prepend(spec_node);
+            docblock_elem.prepend(spec_node.clone());
+            final_spec_node = spec_node;
+        }
+
+        // Replace identifier text occurrences inside the spec block
+        // with `<a>` anchors pointing at the items resolved by rustdoc
+        // via the macro-emitted intra-doc link map.
+        if !link_map.is_empty() {
+            rewrite_text_links(&final_spec_node, link_map);
         }
     }
 
@@ -953,6 +971,282 @@ pre .verus-spec {
             .as_bytes(),
         )
         .expect("write css file");
+}
+
+/// Find the rendered intra-doc link map between
+/// `<!--verusdoc_link_map_start-->` / `<!--verusdoc_link_map_end-->`
+/// comment markers in the docblock, build a `name → href` table from
+/// the resolved `<a>` elements between them, and detach everything in
+/// the range (markers and resolved content) so the visible docs don't
+/// show the helper map.
+///
+/// The macro-emitted markdown is:
+///
+/// ```text
+/// <!--verusdoc_link_map_start-->
+///
+/// - [`agree_up_to`]
+/// - [`Log::append`]
+///
+/// <!--verusdoc_link_map_end-->
+/// ```
+///
+/// which rustdoc resolves to:
+///
+/// ```html
+/// <!--verusdoc_link_map_start-->
+/// <ul>
+///   <li><a href="…/fn.agree_up_to.html"><code>agree_up_to</code></a></li>
+///   <li><a href="…/struct.Log.html#method.append"><code>append</code></a></li>
+/// </ul>
+/// <!--verusdoc_link_map_end-->
+/// ```
+///
+/// Note rustdoc shortens the displayed text of a multi-segment intra-
+/// doc link to its last segment (e.g. `Log::append` renders as
+/// `append`). We don't get back the original key on the rendering
+/// side — we recover the map key from the `<a>`'s `title` attribute
+/// when it's a multi-segment path, and fall back to its text content
+/// otherwise.
+fn extract_and_detach_link_map(docblock_elem: &NodeRef) -> HashMap<String, String> {
+    let mut map: HashMap<String, String> = HashMap::new();
+    let start_marker = "verusdoc_link_map_start";
+    let end_marker = "verusdoc_link_map_end";
+
+    // Find the start-marker comment.
+    let descendants: Vec<NodeRef> = docblock_elem.descendants().collect();
+    let start_idx = descendants.iter().position(|n| match n.as_comment() {
+        Some(c) => c.borrow().contains(start_marker),
+        None => false,
+    });
+    let Some(start_idx) = start_idx else {
+        return map;
+    };
+    let end_idx_rel = descendants[start_idx + 1..].iter().position(|n| match n.as_comment() {
+        Some(c) => c.borrow().contains(end_marker),
+        None => false,
+    });
+    let Some(end_idx_rel) = end_idx_rel else {
+        return map;
+    };
+    let end_idx = start_idx + 1 + end_idx_rel;
+
+    // Gather anchors strictly between the markers.
+    for node in &descendants[start_idx + 1..end_idx] {
+        if let Some(elem) = node.as_element() {
+            if &*elem.name.local == "a" {
+                let attrs = elem.attributes.borrow();
+                let Some(href) = attrs.get(local_name!("href")) else {
+                    continue;
+                };
+                // Use `title` to recover the original path (e.g.
+                // `Log::append`); rustdoc otherwise renders just the
+                // last segment as the anchor text.
+                let title = attrs.get(local_name!("title"));
+                let mut key_from_title: Option<String> = None;
+                if let Some(t) = title {
+                    // Title is typically "fn kronoforge_theory::prelude::agree_up_to"
+                    // or "method kronoforge_theory_log::struct.Log::append".
+                    // Grab the segment list after the leading "kind " word.
+                    if let Some(rest) = t.split_once(' ').map(|(_, r)| r) {
+                        key_from_title = Some(rest.to_string());
+                    } else {
+                        key_from_title = Some(t.to_string());
+                    }
+                }
+                let text = node.text_contents();
+                let bare_key = text.trim().to_string();
+                let href_owned = href.to_string();
+                map.insert(bare_key.clone(), href_owned.clone());
+                if let Some(k) = key_from_title {
+                    // Strip the leading kind word and any leading "::" Verus paths.
+                    if !k.is_empty() && k != bare_key {
+                        map.insert(k.clone(), href_owned.clone());
+                        // Also register just the tail segment after `::`.
+                        if let Some(tail) = k.rsplit("::").next() {
+                            map.entry(tail.to_string()).or_insert_with(|| href_owned.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Detach the marker-range nodes from the docblock. Detach starting
+    // from the start-marker walking forward sibling-by-sibling until
+    // we pass the end-marker (markers are emitted as top-level
+    // children of the docblock by pulldown-cmark since they sit at
+    // root markdown level).
+    if let Some(start_node) = descendants.get(start_idx) {
+        let mut cur = Some(start_node.clone());
+        let mut passed_end = false;
+        while let Some(n) = cur {
+            let next = n.next_sibling();
+            // Check if this node contains the end-marker.
+            let contains_end = match n.as_comment() {
+                Some(c) => c.borrow().contains(end_marker),
+                None => n.descendants().any(|d| match d.as_comment() {
+                    Some(c) => c.borrow().contains(end_marker),
+                    None => false,
+                }),
+            };
+            n.detach();
+            if contains_end {
+                passed_end = true;
+                break;
+            }
+            cur = next;
+        }
+        let _ = passed_end;
+    }
+
+    map
+}
+
+fn rewrite_text_links(node: &NodeRef, link_map: &HashMap<String, String>) {
+    if let Some(elem) = node.as_element() {
+        let tag = &*elem.name.local;
+        // Never rewrite text that's already inside an anchor or a
+        // verus / rustdoc-meaningful styling span. This protects
+        // attributes (`#[trigger]`), comments, the spec-block /
+        // mode keyword spans we built ourselves, and any links the
+        // rendered output already had.
+        if tag == "a" {
+            return;
+        }
+        let attrs = elem.attributes.borrow();
+        if let Some(class) = attrs.get(local_name!("class")) {
+            for c in class.split_whitespace() {
+                if matches!(
+                    c,
+                    "attr"
+                        | "comment"
+                        | "kw"
+                        | "verus-spec-keyword"
+                        | "verus-sig-keyword"
+                        | "verus-ret-name"
+                ) {
+                    return;
+                }
+            }
+        }
+    }
+    let children: Vec<NodeRef> = node.children().collect();
+    for child in children {
+        if child.as_text().is_some() {
+            rewrite_text_node(&child, link_map);
+        } else {
+            rewrite_text_links(&child, link_map);
+        }
+    }
+}
+
+fn rewrite_text_node(text_node: &NodeRef, link_map: &HashMap<String, String>) {
+    let Some(text_ref) = text_node.as_text() else {
+        return;
+    };
+    let text: String = text_ref.borrow().to_string();
+    let Some(replacements) = split_text_with_links(&text, link_map) else {
+        return;
+    };
+    // Insert replacements before the text node, then detach the
+    // original text node.
+    for r in &replacements {
+        text_node.insert_before(r.clone());
+    }
+    text_node.detach();
+}
+
+fn split_text_with_links(
+    text: &str,
+    link_map: &HashMap<String, String>,
+) -> Option<Vec<NodeRef>> {
+    if link_map.is_empty() {
+        return None;
+    }
+    let mut names: Vec<&str> = link_map.keys().map(String::as_str).collect();
+    // Longest first so multi-segment paths (`Log::append`) consume
+    // the whole match before a bare-segment key (`Log` or `append`)
+    // gets a chance.
+    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    let bytes = text.as_bytes();
+    let mut out: Vec<NodeRef> = vec![];
+    let mut last_emit = 0_usize;
+    let mut cursor = 0_usize;
+    let mut matched_any = false;
+    while cursor < bytes.len() {
+        let mut hit: Option<(&str, usize)> = None;
+        for &name in &names {
+            let nb = name.as_bytes();
+            if cursor + nb.len() > bytes.len() {
+                continue;
+            }
+            if &bytes[cursor..cursor + nb.len()] != nb {
+                continue;
+            }
+            let prev_ok = cursor == 0 || !is_ident_byte(bytes[cursor - 1]);
+            let end = cursor + nb.len();
+            let next_ok = end == bytes.len() || !is_ident_byte(bytes[end]);
+            if prev_ok && next_ok {
+                hit = Some((name, end));
+                break;
+            }
+        }
+        if let Some((name, end)) = hit {
+            if last_emit < cursor {
+                out.push(NodeRef::new_text(&text[last_emit..cursor]));
+            }
+            let url = link_map.get(name).expect("name in map");
+            out.push(mk_anchor(name, url));
+            matched_any = true;
+            last_emit = end;
+            cursor = end;
+        } else {
+            // Advance by one UTF-8 char boundary.
+            cursor += utf8_char_len(bytes[cursor]);
+        }
+    }
+    if !matched_any {
+        return None;
+    }
+    if last_emit < bytes.len() {
+        out.push(NodeRef::new_text(&text[last_emit..]));
+    }
+    Some(out)
+}
+
+const fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+const fn utf8_char_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b < 0xC0 {
+        // continuation byte; shouldn't be the start position but
+        // defend against bad input.
+        1
+    } else if b < 0xE0 {
+        2
+    } else if b < 0xF0 {
+        3
+    } else {
+        4
+    }
+}
+
+fn mk_anchor(text: &str, href: &str) -> NodeRef {
+    let qual = QualName::new(None, ns!(html), local_name!("a"));
+    let nr = NodeRef::new_element(
+        qual,
+        vec![(
+            kuchiki::ExpandedName::new(ns!(), local_name!("href")),
+            kuchiki::Attribute { prefix: None, value: href.to_string() },
+        )],
+    );
+    set_class_attribute(&nr, "verus-spec-link");
+    nr.append(NodeRef::new_text(text));
+    nr
 }
 
 /// Markup we want to mirror onto re-export pages: the verus mode
