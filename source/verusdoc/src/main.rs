@@ -6,8 +6,9 @@ use html5ever::{QualName, local_name, namespace_url, ns};
 use kuchiki::NodeRef;
 use kuchiki::traits::TendrilSink;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 #[derive(Serialize, Deserialize)]
@@ -45,11 +46,27 @@ fn main() {
 
     // Process every documentation HTML file in the directory.
 
+    let mut html_paths: Vec<std::path::PathBuf> = vec![];
     for entry in WalkDir::new("doc").into_iter().filter_map(|e| e.ok()) {
         if entry.path().extension().map(|s| s == "html").unwrap_or(false) {
+            html_paths.push(entry.path().to_owned());
             process_file(entry.path())
         }
     }
+
+    // Cross-page markup propagation: rustdoc inlines `pub use
+    // other_crate::*` re-exports onto separate fn pages in the
+    // re-exporting crate, but the macro-injected
+    // `verusdoc_special_attr` doc attributes don't survive cross-
+    // crate metadata. The original home-crate page got the verus
+    // markup in the per-file pass above; the inlined re-export
+    // page is plain rustc-rendered output. Walk the rendered tree
+    // a second time, build an index keyed by the page's `Source`
+    // link target (`src/<crate>/<file>.rs.html#<lines>`), and copy
+    // the verus mode-keyword spans + the verus-spec block from each
+    // home page onto every re-export page that points at the same
+    // source.
+    propagate_reexport_markup(&html_paths);
 }
 
 fn process_file(path: &Path) {
@@ -936,6 +953,212 @@ pre .verus-spec {
             .as_bytes(),
         )
         .expect("write css file");
+}
+
+/// Markup we want to mirror onto re-export pages: the verus mode
+/// keyword spans (e.g. `<span class="verus-sig-keyword">proof </span>`)
+/// that get inserted into the signature, plus the
+/// `<div class="verus-spec">…</div>` block of clauses / body that
+/// gets appended into the same `<pre class="rust item-decl">` `<code>`.
+///
+/// We carry these as serialized HTML strings rather than DOM nodes
+/// because `verus_*` content only contains plain text and `<span>`
+/// elements with class attributes — no anchors that would need their
+/// hrefs rewritten when moved between pages.
+struct ItemDeclMarkup {
+    /// Concatenated HTML of the mode-keyword spans, in source order.
+    sig_keywords_html: String,
+    /// HTML of the `<div class="verus-spec">…</div>`, if any.
+    spec_div_html: Option<String>,
+}
+
+fn propagate_reexport_markup(html_paths: &[PathBuf]) {
+    // Build src-key → markup index from pages that already carry
+    // verus markup (i.e. the home-crate pages where the macro got to
+    // run during the rustdoc compile).
+    let mut index: HashMap<String, ItemDeclMarkup> = HashMap::new();
+    for path in html_paths {
+        let html = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if !html.contains("verus-sig-keyword") && !html.contains("verus-spec") {
+            continue;
+        }
+        let Some((item_decl_inner, src_key)) = parse_item_decl(&html) else {
+            continue;
+        };
+        let sig_keywords_html = extract_sig_keywords_html(&item_decl_inner);
+        let spec_div_html = extract_spec_div_html(&item_decl_inner);
+        if sig_keywords_html.is_empty() && spec_div_html.is_none() {
+            continue;
+        }
+        index
+            .entry(src_key)
+            .or_insert(ItemDeclMarkup { sig_keywords_html, spec_div_html });
+    }
+
+    if index.is_empty() {
+        return;
+    }
+
+    // Splice missing markup into facade pages that re-export the
+    // same source span.
+    for path in html_paths {
+        let html = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if html.contains("verus-sig-keyword") || html.contains("verus-spec") {
+            continue;
+        }
+        let Some((_, src_key)) = parse_item_decl(&html) else {
+            continue;
+        };
+        let Some(markup) = index.get(&src_key) else {
+            continue;
+        };
+        if let Some(new_html) = inject_markup(&html, markup) {
+            let _ = std::fs::write(path, new_html);
+        }
+    }
+}
+
+/// Given a full HTML page, find the contents of the
+/// `<pre class="rust item-decl"><code>…</code></pre>` block and the
+/// page's `Source` link key (the `src/<crate>/<file>.rs.html#<lines>`
+/// tail — stripped of the leading `../`s rustdoc uses to reach
+/// `target/doc/src/`). Returns `None` if either piece is missing.
+fn parse_item_decl(html: &str) -> Option<(String, String)> {
+    let pre_open = html.find(r#"<pre class="rust item-decl">"#)?;
+    let body_start = html[pre_open..].find("<code>")? + pre_open + "<code>".len();
+    let body_end_off = html[body_start..].find("</code></pre>")?;
+    let inner = html[body_start..body_start + body_end_off].to_owned();
+
+    // Find any `<a class="src" href="…src/X">`. The class string can
+    // be `src` on its own or `src rightside`.
+    let mut search_from = 0usize;
+    let src_key = loop {
+        let Some(a_start) = html[search_from..].find("<a class=\"src") else {
+            return None;
+        };
+        let a_start = search_from + a_start;
+        let Some(href_start_off) = html[a_start..].find(r#"href=""#) else {
+            search_from = a_start + 1;
+            continue;
+        };
+        let href_start = a_start + href_start_off + r#"href=""#.len();
+        let Some(href_len) = html[href_start..].find('"') else {
+            return None;
+        };
+        let href = &html[href_start..href_start + href_len];
+        if let Some(idx) = href.find("src/") {
+            let tail = &href[idx + "src/".len()..];
+            if !tail.is_empty() {
+                // Normalize the anchor fragment: rustdoc emits the
+                // full line range `#a-b` on the home page's Source
+                // link but only the start line `#a` on the inlined
+                // facade page. Strip everything after the first
+                // dash inside `#…` so both forms key to `#a`.
+                let normalized = match tail.find('#') {
+                    Some(hash) => {
+                        let (path, frag) = tail.split_at(hash);
+                        let frag = &frag[1..]; // skip `#`
+                        let start = match frag.find('-') {
+                            Some(d) => &frag[..d],
+                            None => frag,
+                        };
+                        format!("{path}#{start}")
+                    }
+                    None => tail.to_owned(),
+                };
+                break normalized;
+            }
+        }
+        search_from = href_start + href_len;
+    };
+
+    Some((inner, src_key))
+}
+
+fn extract_sig_keywords_html(inner: &str) -> String {
+    // Mode-keyword spans live as direct children of <code> at the
+    // start of the signature, before `fn `. They look like
+    // `<span class="verus-sig-keyword">proof </span>`. Concat them in
+    // source order.
+    let mut out = String::new();
+    let mut search_from = 0usize;
+    let opener = r#"<span class="verus-sig-keyword">"#;
+    let closer = "</span>";
+    while let Some(rel) = inner[search_from..].find(opener) {
+        let start = search_from + rel;
+        let Some(end_rel) = inner[start..].find(closer) else {
+            break;
+        };
+        let end = start + end_rel + closer.len();
+        out.push_str(&inner[start..end]);
+        search_from = end;
+    }
+    out
+}
+
+fn extract_spec_div_html(inner: &str) -> Option<String> {
+    let opener = r#"<div class="verus-spec">"#;
+    let start = inner.find(opener)?;
+    // Find matching </div> by counting nesting.
+    let mut depth = 1_i32;
+    let mut i = start + opener.len();
+    let bytes = inner.as_bytes();
+    while i < bytes.len() {
+        if inner[i..].starts_with("<div") {
+            depth += 1;
+            i += 4;
+        } else if inner[i..].starts_with("</div>") {
+            depth -= 1;
+            i += "</div>".len();
+            if depth == 0 {
+                return Some(inner[start..i].to_owned());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Inject the markup snippets into the facade page's item-decl
+/// `<pre>`: place the mode-keyword spans immediately before the
+/// literal `fn ` token, and append the `verus-spec` div (with a
+/// leading `\n`) before `</code></pre>`.
+fn inject_markup(html: &str, markup: &ItemDeclMarkup) -> Option<String> {
+    let pre_open = html.find(r#"<pre class="rust item-decl">"#)?;
+    let body_start = html[pre_open..].find("<code>")? + pre_open + "<code>".len();
+    let body_end_off = html[body_start..].find("</code></pre>")?;
+    let body_end = body_start + body_end_off;
+    let body = &html[body_start..body_end];
+
+    let mut new_body = String::with_capacity(body.len() + 256);
+    if !markup.sig_keywords_html.is_empty() {
+        if let Some(fn_idx) = body.find("fn ") {
+            new_body.push_str(&body[..fn_idx]);
+            new_body.push_str(&markup.sig_keywords_html);
+            new_body.push_str(&body[fn_idx..]);
+        } else {
+            new_body.push_str(body);
+        }
+    } else {
+        new_body.push_str(body);
+    }
+    if let Some(spec_div_html) = &markup.spec_div_html {
+        new_body.push('\n');
+        new_body.push_str(spec_div_html);
+    }
+
+    let mut out = String::with_capacity(html.len() + 256);
+    out.push_str(&html[..body_start]);
+    out.push_str(&new_body);
+    out.push_str(&html[body_end..]);
+    Some(out)
 }
 
 #[cfg(test)]
