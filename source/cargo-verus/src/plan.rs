@@ -168,15 +168,26 @@ fn doc_extra_env() -> Map<String, String> {
     let mut m = Map::new();
     m.insert("RUSTC_BOOTSTRAP".to_owned(), "1".to_owned());
 
-    // The verus_!{} macro auto-detects rustdoc via `cfg!(doc)`,
-    // which rustdoc sets only when it's processing a crate to extract
-    // docs (rustc compiles of the same crate, including the wrapped
-    // rustc that builds dep rmetas, leave it unset). That keeps the
-    // `verusdoc_special_attr` doc markers out of vstd's rmeta build,
-    // which would otherwise pair them with `assume_specification`
-    // shapes the VIR translation rejects.
-    //
-    // The rest of the flag set mirrors what
+    // Point cargo at our rustdoc shim. The shim sets `VERUSDOC=1`
+    // before exec'ing the real rustdoc, which makes the verus_!{}
+    // macro inject `verusdoc_special_attr` doc markers — but ONLY
+    // during the rustdoc subprocess. The wrapped rustc invocations
+    // that build dep rmetas (vstd etc.) don't see VERUSDOC=1, so
+    // they don't try to pair marker injection with the
+    // `assume_specification` shapes the VIR translation rejects.
+    let shim = verus_rustdoc_shim_path();
+    m.insert("RUSTDOC".to_owned(), shim.to_string_lossy().into_owned());
+    // The shim looks up the real rustdoc from this env var first,
+    // and falls back to a PATH lookup of `rustdoc` if unset. We try
+    // to resolve it eagerly so unusual rustup setups still work.
+    if let Some(real) = locate_real_rustdoc() {
+        m.insert(
+            "VERUS_REAL_RUSTDOC".to_owned(),
+            real.to_string_lossy().into_owned(),
+        );
+    }
+
+    // The flag set mirrors what
     // `rust_verify::config::enable_default_features_and_verus_attr`
     // injects for rustc-wrapped builds: workspace crates compiled by
     // rustdoc need the same nightly features and tool registrations,
@@ -243,4 +254,48 @@ fn verusdoc_path() -> std::path::PathBuf {
         path.set_extension("exe");
     }
     path
+}
+
+/// Path to the `verus-rustdoc-shim` binary that ships alongside
+/// `cargo-verus`. Same lookup pattern as `get_verus_driver_path` /
+/// `verusdoc_path`: file-replacement on the cargo-verus binary path.
+fn verus_rustdoc_shim_path() -> std::path::PathBuf {
+    let mut path = env::current_exe()
+        .expect("current executable path invalid")
+        .with_file_name("verus-rustdoc-shim");
+    if cfg!(windows) {
+        path.set_extension("exe");
+    }
+    path
+}
+
+/// Resolve the real rustdoc binary so the shim can `exec` it without
+/// re-entering itself (which would loop, since the shim sets
+/// `RUSTDOC=path/to/shim`).
+///
+/// Strategy:
+///
+/// 1. If `VERUS_REAL_RUSTDOC` is already set in our environment,
+///    honour it (lets users / scripts pin the rustdoc).
+/// 2. Otherwise, ask `rustup` to resolve `rustdoc` for the active
+///    toolchain. This is the common case for users who installed
+///    Rust via rustup.
+/// 3. If rustup isn't available, fall back to PATH lookup of
+///    `rustdoc` and let the shim do the same fallback at runtime.
+fn locate_real_rustdoc() -> Option<std::path::PathBuf> {
+    if let Some(p) = env::var_os("VERUS_REAL_RUSTDOC") {
+        return Some(p.into());
+    }
+    if let Ok(out) = std::process::Command::new("rustup")
+        .args(["which", "rustdoc"])
+        .output()
+    {
+        if out.status.success() {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if !path.is_empty() {
+                return Some(std::path::PathBuf::from(path));
+            }
+        }
+    }
+    None
 }

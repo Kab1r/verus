@@ -4,6 +4,21 @@ version = "0.1.0"
 edition = "2021"
 description = "A Cargo subcommand that enables verification of Rust code as part of the normal Cargo workflow."
 
+[[bin]]
+name = "cargo-verus"
+path = "src/main.rs"
+
+# Tiny rustdoc shim that exports `VERUSDOC=1` and execs the real
+# rustdoc. `cargo verus doc` points cargo's `RUSTDOC` env var at this
+# binary so only the rustdoc subprocess sees `VERUSDOC=1` — the
+# wrapped rustc invocations that build dep rmetas (vstd, etc.) don't
+# inherit the marker-injection trigger and so vstd's
+# `assume_specification` shapes round-trip cleanly through VIR
+# translation.
+[[bin]]
+name = "verus-rustdoc-shim"
+path = "src/bin/verus_rustdoc_shim.rs"
+
 [dependencies]
 cargo_metadata = "0.23.1"
 clap = { version = "4.5.53", features = ["derive"] }
