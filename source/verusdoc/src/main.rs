@@ -175,6 +175,35 @@ fn get_single_child(node: &NodeRef) -> Option<NodeRef> {
     Some(child)
 }
 
+/// Move the children of the `<code>` inside `pre_node` into `target`.
+///
+/// The clause expressions arrive as `<pre><code>…</code></pre>` blocks
+/// (rustdoc rendered them that way from the original code-fence in a
+/// doc attribute). When we splice them into the item-decl `<pre>` we
+/// don't want a `<pre>` inside another `<pre>` — the surrounding
+/// item-decl pre already preserves whitespace. So strip the wrapping
+/// pre/code and inline the syntax-highlighted spans directly, the
+/// same way rustdoc renders the constraint list inside
+/// `<div class="where">`.
+fn inline_pre_contents_into(target: &NodeRef, pre_node: &NodeRef) {
+    let mut child = pre_node.first_child();
+    while let Some(c) = child {
+        let next = c.next_sibling();
+        if let Some(elem) = c.as_element() {
+            if &*elem.name.local == "code" {
+                let mut grand = c.first_child();
+                while let Some(g) = grand {
+                    let g_next = g.next_sibling();
+                    g.detach();
+                    target.append(g);
+                    grand = g_next;
+                }
+            }
+        }
+        child = next;
+    }
+}
+
 /// Walk up from `node` looking for a preceding-sibling
 /// `<pre class="rust item-decl">` at any ancestor level. Returns the
 /// `<code>` child of that `<pre>` so callers can append directly to
@@ -284,20 +313,27 @@ fn update_docblock(
     attrs: &Vec<VerusDocAttr>,
     opt_trait_info: &Option<TraitInfo>,
 ) {
-    let mut elems: Vec<NodeRef> = vec![];
-
-    // Add code that looks like
-    // <div class="verus-spec">
-    //   <span class="verus-spec-keyword">requires</span>
-    //   <pre class="... verus-spec-code">...</pre>
-    //   <span class="verus-spec-keyword">ensures</span>
-    //   <pre class="... verus-spec-code">...</pre>
-    // </div>
+    // The output mirrors the rustdoc `where`-clause shape:
+    //
+    //     <div class="verus-spec">requires
+    //         <pre1>
+    //         <pre2>
+    //     ensures
+    //         <pre3>
+    //     </div>
+    //
+    // injected directly into the function's item-decl `<pre>` when one
+    // is available (so the clauses read as a continuation of the
+    // signature). On the fallback path (trait-method pages etc.) the
+    // spec block is prepended to the docblock as before.
 
     if attrs.iter().find(|x| matches!(x, VerusDocAttr::BroadcastGroup)).is_some() {
         docblock_elem.append(mk_spec_keyword_node("broadcast group"));
     }
 
+    // Group spec entries (requires / ensures / recommends / returns
+    // / body) by keyword, preserving the canonical SPEC_NAMES order.
+    let mut grouped: Vec<(&'static str, Vec<NodeRef>)> = vec![];
     for spec_name in SPEC_NAMES.iter() {
         let mut code_blocks: Vec<NodeRef> = attrs
             .iter()
@@ -307,7 +343,7 @@ fn update_docblock(
             })
             .collect();
 
-        // De-duplicate identical spec blocks (can happen with #[verus_spec] + rustdoc pass)
+        // De-duplicate identical spec blocks (can happen with `#[verus_spec]` + rustdoc pass).
         let mut seen: Vec<String> = Vec::new();
         code_blocks.retain(|nr| {
             let text = nr.text_contents();
@@ -319,42 +355,72 @@ fn update_docblock(
             }
         });
 
-        let is_body = spec_name == &"body";
-
-        if code_blocks.len() > 0 && !is_body {
-            elems.push(mk_spec_keyword_node(spec_name));
-        }
-
-        for code_block in code_blocks.into_iter() {
-            if is_body {
-                set_class_attribute(&code_block, "rust rest-example-rendered verus-body-code");
-            } else {
-                set_class_attribute(&code_block, "rust rest-example-rendered verus-spec-code");
-            }
-            elems.push(code_block);
+        if !code_blocks.is_empty() {
+            grouped.push((spec_name, code_blocks));
         }
     }
 
-    if elems.len() > 0 {
-        let spec_node = mk_spec_node();
-        for elem in elems.into_iter() {
-            spec_node.append(elem);
-        }
-
-        // Prefer to render the spec block *inside* the function's
-        // item-decl `<pre>`, so requires/ensures appear as a
-        // continuation of the signature (the same shape rustdoc
-        // uses for ordinary `where` clauses). Fall back to the
-        // legacy docblock placement if the surrounding HTML doesn't
-        // expose an item-decl pre — that path covers things like
-        // trait-method pages where the spec is rendered next to a
-        // method header rather than a stand-alone signature.
+    if !grouped.is_empty() {
+        // Try to inject the spec block into the function signature's
+        // item-decl `<pre>` (where rustdoc puts ordinary `where`
+        // clauses). If we find one, render the spec as a flat
+        // sequence of literal-whitespace continuation lines —
+        // matching the `<div class="where">where\n    K: …,</div>`
+        // shape — so it visually flows from the closing paren of
+        // the signature.
+        //
+        // If no item-decl pre is available (trait-method pages,
+        // etc.) we fall back to the legacy block layout in the
+        // docblock.
         if let Some(item_decl_code) = find_item_decl_code(docblock_elem) {
+            let spec_node = mk_spec_node();
+            let mut first_keyword = true;
+            for (spec_name, code_blocks) in grouped.iter() {
+                let is_body = *spec_name == "body";
+                if !is_body {
+                    if !first_keyword {
+                        spec_node.append(NodeRef::new_text("\n"));
+                    }
+                    spec_node.append(mk_spec_keyword_node(spec_name));
+                    first_keyword = false;
+                }
+                for code_block in code_blocks.iter() {
+                    spec_node.append(NodeRef::new_text(if is_body { "\n" } else { "\n    " }));
+                    inline_pre_contents_into(&spec_node, code_block);
+                }
+            }
             // A bare newline before the div makes the block render on
-            // its own line inside the surrounding <pre>.
+            // its own line inside the surrounding `<pre>`.
             item_decl_code.append(NodeRef::new_text("\n"));
             item_decl_code.append(spec_node);
         } else {
+            // Fallback: keep the legacy block layout — keyword span
+            // followed by `<pre class="verus-spec-code">` blocks.
+            let mut elems: Vec<NodeRef> = vec![];
+            for (spec_name, code_blocks) in grouped.into_iter() {
+                let is_body = spec_name == "body";
+                if !is_body {
+                    elems.push(mk_spec_keyword_node(spec_name));
+                }
+                for code_block in code_blocks.into_iter() {
+                    if is_body {
+                        set_class_attribute(
+                            &code_block,
+                            "rust rest-example-rendered verus-body-code",
+                        );
+                    } else {
+                        set_class_attribute(
+                            &code_block,
+                            "rust rest-example-rendered verus-spec-code",
+                        );
+                    }
+                    elems.push(code_block);
+                }
+            }
+            let spec_node = mk_spec_node();
+            for elem in elems.into_iter() {
+                spec_node.append(elem);
+            }
             docblock_elem.prepend(spec_node);
         }
     }
@@ -796,11 +862,35 @@ fn write_css(dir_path: &Path) {
     rustdoc_css
         .write_all(
             r#"
-/* Spec/body blocks live inside the item-decl <pre> when one is
- * present (find_item_decl_code in main.rs), so their typography
- * inherits from the surrounding <pre>. The block resets are kept so
- * the legacy "spec rendered in docblock" fallback path stays
- * readable on trait-method pages.
+/* The spec block is injected into the item-decl `<pre>` as plain
+ * inline content with literal whitespace (newlines + 4-space indent
+ * for clauses), matching rustdoc's `<div class="where">` shape. No
+ * extra display/padding rules are needed — the surrounding `<pre>`
+ * preserves the whitespace and inherits the right typography.
+ */
+.verus-spec {
+  display: block;
+}
+
+/* Use the theme's main text color for verus-only keywords so they
+ * read the same as `pub`/`fn` in any theme (light/dark/ayu) instead
+ * of the previous hardcoded dark-green that disappeared on dark
+ * backgrounds. The italic flag keeps them visually distinct without
+ * relying on color alone.
+ */
+.verus-sig-keyword,
+.verus-spec-keyword {
+  font-family: "Source Code Pro", monospace;
+  color: var(--main-color, currentColor);
+  font-style: italic;
+}
+
+/* Fallback path: trait-method pages and similar that don't expose a
+ * stand-alone item-decl `<pre>` keep the legacy block layout, where
+ * each clause is its own code block in the docblock. Reset the
+ * surrounding pre's padding/background so it still reads as a
+ * continuation of the surrounding text rather than a separate
+ * snippet.
  */
 .verus-spec-code,
 .verus-body-code {
@@ -812,36 +902,6 @@ fn write_css(dir_path: &Path) {
 .verus-spec-code code,
 .verus-body-code code {
   background: transparent !important;
-}
-
-/* Mirror rustdoc's `where`-clause indentation (~ 4 spaces) so the
- * `requires` / `ensures` headers line up under the closing paren of
- * the signature.
- */
-.verus-spec {
-  display: block;
-}
-.verus-spec .verus-spec-keyword {
-  display: block;
-  padding-left: 4ch;
-}
-.verus-spec .verus-spec-code,
-.verus-spec .verus-body-code {
-  display: block;
-  padding-left: 8ch;
-}
-
-/* Use the theme's main text color for verus-only keywords so they
- * read the same as `pub`/`fn` in any theme (light/dark/ayu) instead
- * of the previous hardcoded dark-green that disappeared on dark
- * backgrounds. The font-style flag keeps them visually distinct
- * without relying on color alone.
- */
-.verus-sig-keyword,
-.verus-spec-keyword {
-  font-family: "Source Code Pro", monospace;
-  color: var(--main-color, currentColor);
-  font-style: italic;
 }
 "#
             .as_bytes(),
