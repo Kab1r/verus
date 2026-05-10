@@ -124,6 +124,20 @@ pub struct VerusConfig {
     pub compile_primary: bool,
     pub verify_deps: bool,
     pub warn_if_nothing_verified: bool,
+    /// When `false`, every package gets `--no-verify` forwarded to the
+    /// verus driver. The driver still applies cfg/feature plumbing
+    /// (`verus_keep_ghost`, `feature(stmt_expr_attributes)`, …) but
+    /// skips SMT verification. Used by `cargo verus doc`, where the
+    /// goal is to render docs against the ghost surface, not to verify.
+    pub verify_anything: bool,
+    /// Extra environment overrides to inject into the cargo invocation,
+    /// alongside the `RUSTC_WRAPPER` / `__VERUS_DRIVER_VIA_CARGO__`
+    /// pair that every cargo-verus subcommand sets. `cargo verus doc`
+    /// uses this to supply `VERUSDOC=1`, `RUSTC_BOOTSTRAP=1`, and a
+    /// `RUSTDOCFLAGS` value that keeps the rustdoc compile of
+    /// workspace crates aligned with what the wrapped rustc invocations
+    /// produce for their dependencies.
+    pub extra_env: Map<String, String>,
 }
 
 pub fn plan_cargo_run(cfg: VerusConfig) -> Result<CargoRunPlan> {
@@ -148,7 +162,18 @@ pub fn plan_cargo_run(cfg: VerusConfig) -> Result<CargoRunPlan> {
     let dep_packages: Set<PackageId> = all_packages.difference(&root_packages).cloned().collect();
 
     let packages_to_process = &all_packages;
-    let packages_to_verify = if cfg.verify_deps { &all_packages } else { &root_packages };
+    let empty_set: Set<PackageId> = Set::new();
+    let packages_to_verify = if !cfg.verify_anything {
+        // `cargo verus doc` and similar erasure-only flows: leave every
+        // package out of the verify set so each gets `--no-verify` from
+        // make_cargo_plan below. The driver still applies its
+        // verus_keep_ghost / feature crate-attr injection.
+        &empty_set
+    } else if cfg.verify_deps {
+        &all_packages
+    } else {
+        &root_packages
+    };
 
     let fwd_verus_args_packages = match fwd_verus_args_to {
         VerusArgFwdSelector::All => &all_packages,
@@ -193,6 +218,7 @@ pub fn plan_cargo_run(cfg: VerusConfig) -> Result<CargoRunPlan> {
         packages_to_verify,
         &cfg.options.verus_args,
         fwd_verus_args_packages,
+        cfg.extra_env,
     )?;
 
     if cfg.options.verbose {
@@ -299,6 +325,18 @@ pub struct CargoRunPlan {
     pub args: Vec<String>,
     pub env: Map<String, String>,
     pub verified_something: bool,
+    /// Commands to run after `cargo` exits successfully. Used by
+    /// `cargo verus doc` to invoke the `verusdoc` HTML post-processor
+    /// once `cargo doc` has finished writing `target/doc`.
+    pub post_run: Vec<PostRunCommand>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PostRunCommand {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub current_dir: PathBuf,
+    pub description: String,
 }
 
 impl CargoRunPlan {
@@ -325,6 +363,10 @@ fn make_cargo_plan(
     fwd_verus_args: &[String],
     // Packages to receive forwarded Verus args
     fwd_verus_args_packages: &Set<PackageId>,
+    // Subcommand-specific env overrides. These are merged in last, so a
+    // subcommand can override anything the common path sets (e.g. for
+    // diagnostic builds).
+    extra_env: Map<String, String>,
 ) -> Result<CargoRunPlan> {
     let mut env_overrides = Map::new();
     env_overrides
@@ -426,7 +468,15 @@ fn make_cargo_plan(
     let mut args = vec![subcommand.to_owned()];
     args.append(&mut cargo_args);
 
-    Ok(CargoRunPlan { current_dir, args, env: env_overrides, verified_something })
+    env_overrides.extend(extra_env);
+
+    Ok(CargoRunPlan {
+        current_dir,
+        args,
+        env: env_overrides,
+        verified_something,
+        post_run: vec![],
+    })
 }
 
 pub fn run_cargo(plan: &CargoRunPlan) -> Result<ExitCode> {
@@ -439,12 +489,40 @@ pub fn run_cargo(plan: &CargoRunPlan) -> Result<ExitCode> {
         .wait()
         .context("Failed to wait for cargo")?;
 
-    match exit_status.code() {
+    let cargo_exit = match exit_status.code() {
         Some(code) => u8::try_from(code)
-            .map(From::from)
-            .map_err(|_| anyhow!("Command {command:?} terminated with an odd exit code: {code}")),
+            .map(ExitCode::from)
+            .map_err(|_| anyhow!("Command {command:?} terminated with an odd exit code: {code}"))?,
         None => bail!("Command {command:?} was terminated by a signal: {exit_status}"),
+    };
+
+    // Skip post-run commands if cargo itself failed; surfacing the
+    // cargo error is more useful than running a post-processor against
+    // partial output.
+    if exit_status.success() {
+        for post in &plan.post_run {
+            run_post(post)?;
+        }
     }
+
+    Ok(cargo_exit)
+}
+
+fn run_post(post: &PostRunCommand) -> Result<()> {
+    let mut command = Command::new(&post.program);
+    command.current_dir(&post.current_dir);
+    command.args(&post.args);
+
+    let status = command
+        .spawn()
+        .with_context(|| format!("Failed to spawn {} ({})", post.description, post.program.display()))?
+        .wait()
+        .with_context(|| format!("Failed to wait for {}", post.description))?;
+
+    if !status.success() {
+        bail!("{} failed with {}", post.description, status);
+    }
+    Ok(())
 }
 
 fn pack_verus_driver_args_for_env(args: impl Iterator<Item = impl AsRef<str>>) -> String {

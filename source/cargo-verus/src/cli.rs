@@ -32,6 +32,19 @@ pub enum VerusSubcommand {
 
     /// Runs the 'cargo check' subcommand
     Check(VerifyCommand),
+
+    /// Build verusdoc-aware HTML documentation for the workspace.
+    ///
+    /// Wraps `cargo doc` with the env vars (`VERUSDOC=1`, `RUSTC_BOOTSTRAP=1`)
+    /// and `RUSTDOCFLAGS` (`--cfg verus_keep_ghost`, feature crate-attrs)
+    /// that the verus_!{} macro and rustdoc need to keep `spec fn` /
+    /// `proof fn` items visible and inject the `verusdoc_special_attr`
+    /// markers consumed by the `verusdoc` post-processor.
+    ///
+    /// All packages get `--no-verify` so the verus driver applies its
+    /// cfg/feature plumbing but skips SMT verification — documentation
+    /// builds are an erasure surface, not a verification surface.
+    Doc(VerifyCommand),
 }
 
 #[derive(Clone, Debug, Args)]
@@ -194,7 +207,8 @@ impl CargoVerusCli {
             VerusSubcommand::New(_) => {}
             VerusSubcommand::Verify(cmd)
             | VerusSubcommand::Build(cmd)
-            | VerusSubcommand::Check(cmd) => {
+            | VerusSubcommand::Check(cmd)
+            | VerusSubcommand::Doc(cmd) => {
                 if cmd.fwd_verus_args_to.is_none() {
                     cmd.fwd_verus_args_to = Some(VerusArgFwdSelector::All)
                 }
@@ -213,7 +227,8 @@ impl CargoVerusCli {
             VerusSubcommand::Verify(cmd)
             | VerusSubcommand::Focus(cmd)
             | VerusSubcommand::Build(cmd)
-            | VerusSubcommand::Check(cmd) => {
+            | VerusSubcommand::Check(cmd)
+            | VerusSubcommand::Doc(cmd) => {
                 let arg_split_pos = cmd.cargo_opts.cargo_args.iter().position(|arg| arg == "--");
                 if let Some(index) = arg_split_pos {
                     let (cargo_args, verus_args) = cmd.cargo_opts.cargo_args.split_at(index);
@@ -233,7 +248,8 @@ impl CargoVerusCli {
             VerusSubcommand::Verify(cmd)
             | VerusSubcommand::Focus(cmd)
             | VerusSubcommand::Build(cmd)
-            | VerusSubcommand::Check(cmd) => {
+            | VerusSubcommand::Check(cmd)
+            | VerusSubcommand::Doc(cmd) => {
                 has_flag_arg_without_space(&cmd.cargo_opts) || has_late_verus_arg(&cmd.cargo_opts)
             }
             VerusSubcommand::New(_) => false,
